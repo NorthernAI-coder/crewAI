@@ -24,6 +24,7 @@ from crewai.events.listeners.tracing.types import TraceEvent
 from crewai.events.listeners.tracing.utils import (
     get_user_id,
     is_tracing_enabled_in_context,
+    is_tui_mode,
     should_auto_collect_first_time_traces,
 )
 from crewai.plus_api import PlusAPI
@@ -71,6 +72,7 @@ class TraceBatchManager:
         self.batch_owner_type: str | None = None
         self.batch_owner_id: str | None = None
         self.backend_initialized: bool = False
+        self.trace_url: str | None = None
         self.ephemeral_trace_url: str | None = None
         try:
             self.plus_api = PlusAPI(
@@ -104,7 +106,9 @@ class TraceBatchManager:
 
             self.record_start_time("execution")
 
-            if should_auto_collect_first_time_traces():
+            if should_auto_collect_first_time_traces() or (
+                is_tui_mode() and not is_tracing_enabled_in_context()
+            ):
                 self.trace_batch_id = self.current_batch.batch_id
             else:
                 self._initialize_backend_batch(
@@ -400,6 +404,7 @@ class TraceBatchManager:
                     else f"{base_url}/crewai_plus/ephemeral_trace_batches/{self.trace_batch_id}?access_code={access_code}"
                 )
 
+                self.trace_url = return_link
                 if self.is_current_batch_ephemeral:
                     self.ephemeral_trace_url = return_link
 
@@ -418,7 +423,7 @@ class TraceBatchManager:
                     title="Trace Batch Finalization",
                     border_style="green",
                 )
-                if not should_auto_collect_first_time_traces():
+                if not should_auto_collect_first_time_traces() and not is_tui_mode():
                     console.print(panel)
 
             else:
