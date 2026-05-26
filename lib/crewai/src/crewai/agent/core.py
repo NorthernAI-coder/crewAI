@@ -764,7 +764,7 @@ class Agent(BaseAgent):
             agents=[self],
             tasks=[task],
             verbose=self.verbose,
-            memory=self.memory,
+            memory=self.memory or False,
         )
         result = crew.kickoff()
         return result.raw

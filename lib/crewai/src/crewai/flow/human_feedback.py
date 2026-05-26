@@ -17,7 +17,7 @@ Example (synchronous, default):
         @human_feedback(
             message="Please review this content:",
             emit=["approved", "rejected"],
-            llm="gpt-4o-mini",
+            llm="gpt-5.4-mini",
         )
         def generate_content(self):
             return {"title": "Article", "body": "Content..."}
@@ -45,7 +45,7 @@ Example (asynchronous with custom provider):
         @human_feedback(
             message="Review this:",
             emit=["approved", "rejected"],
-            llm="gpt-4o-mini",
+            llm="gpt-5.4-mini",
             provider=SlackProvider(),
         )
         def generate_content(self):
@@ -185,7 +185,7 @@ class HumanFeedbackConfig:
 
     message: str
     emit: Sequence[str] | None = None
-    llm: str | BaseLLM | None = "gpt-4o-mini"
+    llm: str | BaseLLM | None = "gpt-5.4-mini"
     default_outcome: str | None = None
     metadata: dict[str, Any] | None = None
     provider: HumanFeedbackProvider | None = None
@@ -235,7 +235,7 @@ class DistilledLessons(BaseModel):
 def human_feedback(
     message: str,
     emit: Sequence[str] | None = None,
-    llm: str | BaseLLM | None = "gpt-4o-mini",
+    llm: str | BaseLLM | None = "gpt-5.4-mini",
     default_outcome: str | None = None,
     metadata: dict[str, Any] | None = None,
     provider: HumanFeedbackProvider | None = None,
@@ -268,7 +268,7 @@ def human_feedback(
             methods that match.
         llm: The LLM model to use for collapsing feedback to outcomes.
             Required when emit is specified. Can be a model string
-            like "gpt-4o-mini" or a BaseLLM instance.
+            like "gpt-5.4-mini" or a BaseLLM instance.
         default_outcome: The outcome to use when the human provides no
             feedback (empty input). Must be one of the emit values
             if emit is specified.
@@ -314,7 +314,7 @@ def human_feedback(
         @human_feedback(
             message="Review and approve or reject:",
             emit=["approved", "rejected", "needs_revision"],
-            llm="gpt-4o-mini",
+            llm="gpt-5.4-mini",
             default_outcome="needs_revision",
         )
         def review_document(self):
@@ -332,7 +332,7 @@ def human_feedback(
         @human_feedback(
             message="Review this content:",
             emit=["approved", "rejected"],
-            llm="gpt-4o-mini",
+            llm="gpt-5.4-mini",
             provider=SlackProvider(channel="#reviews"),
         )
         def generate_content(self):
@@ -344,7 +344,7 @@ def human_feedback(
         if not llm:
             raise ValueError(
                 "llm is required when emit is specified. "
-                "Provide an LLM model string (e.g., 'gpt-4o-mini') or a BaseLLM instance. "
+                "Provide an LLM model string (e.g., 'gpt-5.4-mini') or a BaseLLM instance. "
                 "See the CrewAI Human-in-the-Loop (HITL) documentation for more information: "
                 "https://docs.crewai.com/en/learn/human-feedback-in-flows"
             )
@@ -376,7 +376,7 @@ def human_feedback(
             if llm is None:
                 from crewai.llm import LLM
 
-                return LLM(model="gpt-4o-mini")
+                return LLM(model="gpt-5.4-mini")
             if isinstance(llm, str):
                 from crewai.llm import LLM
 

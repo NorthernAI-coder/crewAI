@@ -937,7 +937,7 @@ class Telemetry:
             value: The attribute value.
         """
 
-        if span is None:
+        if span is None or value is None:
             return
 
         def _operation() -> None:
