@@ -6,8 +6,8 @@ Two-column layout: left sidebar (tasks/agents/tokens) + main content
 
 import json as _json
 import re
-import time
 import threading
+import time
 from typing import Any
 
 from rich.text import Text
@@ -36,6 +36,8 @@ _C_MUTED = "#666666"      # dimmer than _C_DIM for past timeline
 _C_CYAN = "#1F7982"       # alias for teal — used for accents
 
 _STEP_NUMBER_RE = re.compile(r"\bstep\s+(\d+)\b", re.IGNORECASE)
+_REFINEMENT_RE = re.compile(r"^\s*step\s+(\d+)\s*:\s*(.+)\s*$", re.IGNORECASE)
+_INTERNAL_TOOL_NAMES = {"create_reasoning_plan"}
 
 
 def _enable_tracing_in_dotenv() -> None:
@@ -496,6 +498,8 @@ FooterKey .footer-key--key {
 
         self._plan: dict[str, Any] | None = None
         self._plan_step_status: dict[int, str] = {}
+        self._plan_step_tool_outcomes: dict[int, dict[str, int]] = {}
+        self._awaiting_replan = False
 
         self._status = "starting"
         self._start_time = time.time()
@@ -623,13 +627,15 @@ FooterKey .footer-key--key {
             self._current_step = None
             self._timeline = []
             self._elapsed_frozen = time.time() - self._start_time
+            self._collapse_plan_on_task_done()
             for k in self._task_statuses:
                 if self._task_statuses[k] == "active":
                     self._task_statuses[k] = "done"
             now = time.time()
             for entry in self._log_entries:
                 if entry["status"] == "running":
-                    entry["status"] = "success"
+                    entry["status"] = "timeout"
+                    entry["error"] = "No result received before crew completed"
                     entry["duration"] = now - entry["start_time"]
         try:
             from crewai.events.listeners.tracing.trace_listener import TraceCollectionListener
@@ -1301,6 +1307,8 @@ FooterKey .footer-key--key {
                                 for s in data["steps"]
                                 if "step_number" in s
                             }
+                            self._plan_step_tool_outcomes = {}
+                            self._awaiting_replan = False
                     except (ValueError, KeyError):
                         pass
                     return
@@ -1313,9 +1321,109 @@ FooterKey .footer-key--key {
         if status == "active":
             for sn, current in list(self._plan_step_status.items()):
                 if sn != step_number and current == "active":
-                    self._plan_step_status[sn] = "pending"
+                    self._plan_step_status[sn] = (
+                        "failed"
+                        if self._plan_step_has_only_failed_tools(sn)
+                        else "pending"
+                    )
 
         self._plan_step_status[step_number] = status
+
+    def _find_plan_step_for_tool(self, tool_name: str) -> int | None:
+        """Find the first unfinished plan step whose description names this tool."""
+        if not self._plan:
+            return None
+
+        steps = self._plan.get("steps")
+        if not isinstance(steps, list):
+            return None
+
+        normalized_tool = tool_name.lower()
+        spaced_tool = normalized_tool.replace("_", " ")
+        for wanted_status in ("active", "pending"):
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                step_number = step.get("step_number")
+                if not isinstance(step_number, int):
+                    continue
+                if self._plan_step_status.get(step_number) != wanted_status:
+                    continue
+                description = str(step.get("description", "")).lower()
+                if normalized_tool in description or spaced_tool in description:
+                    return step_number
+        return None
+
+    def _record_plan_step_tool_outcome(
+        self, step_number: int | None, outcome: str
+    ) -> None:
+        if step_number is None:
+            return
+
+        outcomes = self._plan_step_tool_outcomes.setdefault(
+            step_number, {"success": 0, "error": 0}
+        )
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+
+    def _plan_step_has_only_failed_tools(self, step_number: int) -> bool:
+        outcomes = self._plan_step_tool_outcomes.get(step_number)
+        if not outcomes:
+            return False
+        return outcomes.get("error", 0) > 0 and outcomes.get("success", 0) == 0
+
+    def _plan_step_completion_status(self, step_number: int) -> str:
+        return (
+            "failed"
+            if self._plan_step_has_only_failed_tools(step_number)
+            else "done"
+        )
+
+    def _mark_plan_goal_achieved(self, step_number: int | None = None) -> None:
+        """Collapse early-goal/skipped plan steps into completed UI state."""
+        if not self._plan:
+            return
+
+        if step_number is not None:
+            self._set_plan_step_status(step_number, "done")
+
+        for sn, current in list(self._plan_step_status.items()):
+            if current in ("pending", "active"):
+                self._plan_step_status[sn] = "done"
+
+    def _collapse_plan_on_task_done(self) -> None:
+        """Collapse unfinished display-only plan steps once the task succeeds."""
+        if not self._plan:
+            return
+
+        for sn, current in list(self._plan_step_status.items()):
+            if current in ("pending", "active"):
+                self._plan_step_status[sn] = "done"
+
+    def _prepare_for_replan(self) -> None:
+        """Keep current statuses visible while allowing the next plan to replace it."""
+        self._awaiting_replan = True
+
+    def _apply_plan_refinements(self, refinements: list[str] | None) -> None:
+        """Apply refined descriptions while leaving statuses as pending/done/failed."""
+        if not self._plan or not refinements:
+            return
+
+        steps = self._plan.get("steps")
+        if not isinstance(steps, list):
+            return
+
+        steps_by_number = {
+            step.get("step_number"): step for step in steps if isinstance(step, dict)
+        }
+        for refinement in refinements:
+            match = _REFINEMENT_RE.match(refinement)
+            if not match:
+                continue
+            step_number = int(match.group(1))
+            description = match.group(2).strip()
+            step = steps_by_number.get(step_number)
+            if step is not None and description:
+                step["description"] = description
 
     def _try_parse_step_observation(self, text: str) -> bool:
         """Parse streamed observation JSON and update the exact step it names."""
@@ -1343,7 +1451,11 @@ FooterKey .footer-key--key {
                         if payload.get("step_completed_successfully") is True
                         else "failed"
                     )
+                    if status == "done":
+                        status = self._plan_step_completion_status(step_number)
                     self._set_plan_step_status(step_number, status)
+                    if payload.get("goal_already_achieved") is True:
+                        self._mark_plan_goal_achieved(step_number)
                     updated = True
             i = start + max(offset, 1)
 
@@ -1394,7 +1506,11 @@ FooterKey .footer-key--key {
             AgentLogsStartedEvent,
         )
         from crewai.events.types.observation_events import (
+            GoalAchievedEarlyEvent,
+            PlanRefinementEvent,
+            PlanReplanTriggeredEvent,
             StepObservationCompletedEvent,
+            StepObservationFailedEvent,
             StepObservationStartedEvent,
         )
         from crewai.events.types.task_events import (
@@ -1429,6 +1545,8 @@ FooterKey .footer-key--key {
                 self._is_streaming = False
                 self._plan = None
                 self._plan_step_status = {}
+                self._plan_step_tool_outcomes = {}
+                self._awaiting_replan = False
                 self._plan_tools_used = []
 
                 for k in self._task_statuses:
@@ -1524,7 +1642,10 @@ FooterKey .footer-key--key {
                 self._task_full_output += event.chunk
                 self._current_llm_text += event.chunk
                 self._live_out_tokens += 1
-                if not self._plan and '{"plan"' in self._streaming_text:
+                if (
+                    (not self._plan or self._awaiting_replan)
+                    and '{"plan"' in self._streaming_text
+                ):
                     self._try_parse_plan(self._streaming_text)
                 if self._plan and "step_completed_successfully" in self._streaming_text:
                     self._try_parse_step_observation(self._streaming_text)
@@ -1550,14 +1671,62 @@ FooterKey .footer-key--key {
                 status = (
                     "done" if event.step_completed_successfully else "failed"
                 )
+                if status == "done":
+                    status = self._plan_step_completion_status(event.step_number)
                 self._set_plan_step_status(event.step_number, status)
 
         self._register_handler(
             StepObservationCompletedEvent, on_step_observation_completed
         )
 
+        @crewai_event_bus.on(StepObservationFailedEvent)
+        def on_step_observation_failed(
+            source: Any, event: StepObservationFailedEvent
+        ) -> None:
+            with self._lock:
+                self._set_plan_step_status(
+                    event.step_number,
+                    self._plan_step_completion_status(event.step_number),
+                )
+
+        self._register_handler(StepObservationFailedEvent, on_step_observation_failed)
+
+        @crewai_event_bus.on(PlanRefinementEvent)
+        def on_plan_refinement(source: Any, event: PlanRefinementEvent) -> None:
+            with self._lock:
+                if event.step_number:
+                    self._set_plan_step_status(
+                        event.step_number,
+                        self._plan_step_completion_status(event.step_number),
+                    )
+                self._apply_plan_refinements(event.refinements)
+
+        self._register_handler(PlanRefinementEvent, on_plan_refinement)
+
+        @crewai_event_bus.on(PlanReplanTriggeredEvent)
+        def on_plan_replan_triggered(
+            source: Any, event: PlanReplanTriggeredEvent
+        ) -> None:
+            with self._lock:
+                self._prepare_for_replan()
+                self._current_step = ("yellow", "Replanning…", event.replan_reason)
+
+        self._register_handler(PlanReplanTriggeredEvent, on_plan_replan_triggered)
+
+        @crewai_event_bus.on(GoalAchievedEarlyEvent)
+        def on_goal_achieved_early(
+            source: Any, event: GoalAchievedEarlyEvent
+        ) -> None:
+            with self._lock:
+                self._mark_plan_goal_achieved(event.step_number or None)
+
+        self._register_handler(GoalAchievedEarlyEvent, on_goal_achieved_early)
+
         @crewai_event_bus.on(ToolUsageStartedEvent)
         def on_tool_started(source: Any, event: ToolUsageStartedEvent) -> None:
+            if event.tool_name in _INTERNAL_TOOL_NAMES:
+                return
+
             with self._lock:
                 self._is_streaming = False
                 self._streaming_text = ""
@@ -1579,8 +1748,15 @@ FooterKey .footer-key--key {
                         return
                 for entry in self._log_entries:
                     if entry["status"] == "running" and entry["tool_name"] != event.tool_name:
-                        entry["status"] = "success"
+                        entry["status"] = "timeout"
+                        entry["error"] = "No result received before the next tool started"
                         entry["duration"] = now - entry["start_time"]
+                        self._record_plan_step_tool_outcome(
+                            entry.get("plan_step_number"), "error"
+                        )
+                plan_step_number = self._find_plan_step_for_tool(event.tool_name)
+                if plan_step_number is not None:
+                    self._set_plan_step_status(plan_step_number, "active")
                 self._current_task_steps.append(
                     {
                         "type": "tool",
@@ -1600,6 +1776,7 @@ FooterKey .footer-key--key {
                         "start_time": time.time(),
                         "duration": None,
                         "task_idx": self._current_task_idx,
+                        "plan_step_number": plan_step_number,
                     }
                 )
             self._complete_step("teal", f"⚡ {event.tool_name}…")
@@ -1608,6 +1785,9 @@ FooterKey .footer-key--key {
 
         @crewai_event_bus.on(ToolUsageFinishedEvent)
         def on_tool_finished(source: Any, event: ToolUsageFinishedEvent) -> None:
+            if event.tool_name in _INTERNAL_TOOL_NAMES:
+                return
+
             with self._lock:
                 if event.output is not None:
                     out = event.output
@@ -1635,7 +1815,7 @@ FooterKey .footer-key--key {
                         step["style"] = "green"
                         break
                 from_cache = getattr(event, "from_cache", False)
-                for entry in self._log_entries:
+                for entry in reversed(self._log_entries):
                     if entry["tool_name"] == event.tool_name and (
                         entry["status"] == "running"
                         or (entry["status"] == "success" and entry["result"] is None)
@@ -1644,6 +1824,9 @@ FooterKey .footer-key--key {
                         entry["result"] = result_str
                         entry["duration"] = time.time() - entry["start_time"]
                         entry["from_cache"] = from_cache
+                        self._record_plan_step_tool_outcome(
+                            entry.get("plan_step_number"), "success"
+                        )
                         break
             self._replace_step("green", f"✔ {event.tool_name}")
 
@@ -1651,6 +1834,9 @@ FooterKey .footer-key--key {
 
         @crewai_event_bus.on(ToolUsageErrorEvent)
         def on_tool_error(source: Any, event: ToolUsageErrorEvent) -> None:
+            if event.tool_name in _INTERNAL_TOOL_NAMES:
+                return
+
             error_text = str(event.error)[:200] if event.error else ""
             with self._lock:
                 for step in reversed(self._current_task_steps):
@@ -1667,7 +1853,7 @@ FooterKey .footer-key--key {
                         step["summary"] = f"✘ {event.tool_name}"
                         step["style"] = "red"
                         break
-                for idx, entry in enumerate(self._log_entries):
+                for idx, entry in reversed(list(enumerate(self._log_entries))):
                     if entry["tool_name"] == event.tool_name and (
                         entry["status"] == "running"
                         or (entry["status"] == "success" and entry["result"] is None)
@@ -1675,6 +1861,9 @@ FooterKey .footer-key--key {
                         entry["status"] = "error"
                         entry["error"] = str(event.error) if event.error else None
                         entry["duration"] = time.time() - entry["start_time"]
+                        self._record_plan_step_tool_outcome(
+                            entry.get("plan_step_number"), "error"
+                        )
                         self._log_expanded.add(idx)
                         break
             self._replace_step("red", f"✘ {event.tool_name}", error_text)
@@ -1753,6 +1942,7 @@ FooterKey .footer-key--key {
             with self._lock:
                 idx = self._current_task_idx
                 self._task_statuses[idx] = "done"
+                self._collapse_plan_on_task_done()
 
                 if self._current_llm_text.strip():
                     self._current_task_steps.append(
